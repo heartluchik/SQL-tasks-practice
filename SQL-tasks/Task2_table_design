@@ -1,0 +1,330 @@
+
+
+/* Design an optimized table structure to store cleaned call logs */
+
+CREATE TABLE call_log (
+    call_id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,  -- internal surrogate key
+
+    ats_call_id VARCHAR2(64) NOT NULL,                         -- unique call id from the ATS system
+    call_start_date DATE NOT NULL,
+    call_end_date DATE NOT NULL,
+
+    outgoing_phone VARCHAR2(128),
+    incoming_phone VARCHAR2(128),
+
+    call_status VARCHAR2(20) NOT NULL,                         -- ANSWERED / REJECTED / BUSY
+    is_redirected CHAR(1) NOT NULL,                            -- Y / N
+
+    call_duration_sec NUMBER,                                  -- duration in seconds
+    outgoing_contragent_id INTEGER,                             -- matched by outgoing phone (if found)
+    incoming_contragent_id INTEGER,                             -- matched by incoming phone (if found)
+
+    created_date DATE DEFAULT SYSDATE,
+
+    /* Basic validation constraints */
+    CONSTRAINT chk_call_status CHECK (call_status IN ('ANSWERED', 'REJECTED', 'BUSY')),
+    CONSTRAINT chk_is_redirected CHECK (is_redirected IN ('Y', 'N')),
+
+    /* Foreign keys to contragents table */
+    CONSTRAINT fk_outgoing_contragent FOREIGN KEY (outgoing_contragent_id)
+        REFERENCES contragents(contragent_id),
+
+    CONSTRAINT fk_incoming_contragent FOREIGN KEY (incoming_contragent_id)
+        REFERENCES contragents(contragent_id)
+);
+
+-- Unique index to prevent duplicate ATS calls
+CREATE UNIQUE INDEX idx_call_log_ats_id ON call_log(ats_call_id);
+
+-- Composite index for typical filtering/search (time range + status + redirected)
+CREATE INDEX idx_call_log_search ON call_log(call_start_date, call_status, is_redirected);
+
+-- Indexes to speed up joins through the foreign keys
+CREATE INDEX idx_call_log_out_contragent ON call_log(outgoing_contragent_id);
+CREATE INDEX idx_call_log_in_contragent ON call_log(incoming_contragent_id);
+
+-- Documentation comments
+COMMENT ON TABLE call_log IS 'Cleaned ATS call log with links to contragents';
+COMMENT ON COLUMN call_log.ats_call_id IS 'Unique call identifier from ATS system';
+COMMENT ON COLUMN call_log.call_start_date IS 'Call start datetime';
+COMMENT ON COLUMN call_log.call_end_date IS 'Call end datetime';
+COMMENT ON COLUMN call_log.call_duration_sec IS 'Call duration in seconds';
+COMMENT ON COLUMN call_log.is_redirected IS 'Redirect flag (Y/N)';
+COMMENT ON COLUMN call_log.outgoing_contragent_id IS 'Contragent matched by outgoing phone';
+COMMENT ON COLUMN call_log.incoming_contragent_id IS 'Contragent matched by incoming phone';
+
+
+
+/* PL/SQL procedure to load data from LOG_RAW into CALL_LOG
+       - Processes data in batches for performance
+       - Uses FORALL ... SAVE EXCEPTIONS for bulk insert with row-level errors
+       - Uses a simple in-memory cache for phone->contragent lookup */
+
+CREATE OR REPLACE PROCEDURE load_call_log_from_raw
+AS
+    /* Batch size for bulk inserts */
+    c_batch_size CONSTANT NUMBER := 5000;
+
+    /* Basic stats */
+    v_processed_count NUMBER := 0;
+    v_error_count NUMBER := 0;
+    v_start_time TIMESTAMP := SYSTIMESTAMP;
+
+    /* Collection types (arrays) for bulk processing */
+    TYPE t_call_ids IS TABLE OF VARCHAR2(64);
+    TYPE t_start_dates IS TABLE OF DATE;
+    TYPE t_end_dates IS TABLE OF DATE;
+    TYPE t_outgoing_phones IS TABLE OF VARCHAR2(128);
+    TYPE t_incoming_phones IS TABLE OF VARCHAR2(128);
+    TYPE t_statuses IS TABLE OF VARCHAR2(20);
+    TYPE t_is_redirected IS TABLE OF CHAR(1);
+    TYPE t_durations IS TABLE OF NUMBER;
+    TYPE t_outgoing_contragents IS TABLE OF INTEGER;
+    TYPE t_incoming_contragents IS TABLE OF INTEGER;
+
+    /* Data collections used for FORALL */
+    v_call_ids t_call_ids := t_call_ids();
+    v_start_dates t_start_dates := t_start_dates();
+    v_end_dates t_end_dates := t_end_dates();
+    v_outgoing_phones t_outgoing_phones := t_outgoing_phones();
+    v_incoming_phones t_incoming_phones := t_incoming_phones();
+    v_statuses t_statuses := t_statuses();
+    v_is_redirected t_is_redirected := t_is_redirected();
+    v_durations t_durations := t_durations();
+    v_outgoing_contragents t_outgoing_contragents := t_outgoing_contragents();
+    v_incoming_contragents t_incoming_contragents := t_incoming_contragents();
+
+    /* Simple cache: normalized_phone -> contragent_id */
+    TYPE t_phone_cache IS TABLE OF INTEGER INDEX BY VARCHAR2(128);
+    v_phone_cache t_phone_cache;
+
+    /* Lookup function with caching */
+    FUNCTION find_contragent_id(p_phone_num VARCHAR2) RETURN INTEGER
+    IS
+        v_contragent_id INTEGER;
+        v_phone_key VARCHAR2(128);
+    BEGIN
+        IF p_phone_num IS NULL THEN
+            RETURN NULL;
+        END IF;
+
+        -- Normalize phone string for consistent matching
+        v_phone_key := LOWER(TRIM(p_phone_num));
+
+        -- Check cache first
+        IF v_phone_cache.EXISTS(v_phone_key) THEN
+            RETURN v_phone_cache(v_phone_key);
+        END IF;
+
+        -- If not cached, query DB (assumes functional index on LOWER(phone_num) exists)
+        BEGIN
+            SELECT contragent_id
+            INTO v_contragent_id
+            FROM contragents
+            WHERE LOWER(phone_num) = v_phone_key
+              AND ROWNUM = 1;
+
+            -- Store result in cache
+            v_phone_cache(v_phone_key) := v_contragent_id;
+            RETURN v_contragent_id;
+
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                -- Cache "not found" to avoid repeated DB lookups
+                v_phone_cache(v_phone_key) := NULL;
+                RETURN NULL;
+            WHEN OTHERS THEN
+                RETURN NULL;
+        END;
+    END find_contragent_id;
+
+
+    /* Inserts the current batch with FORALL and then clears collections */
+    PROCEDURE process_batch
+    IS
+        v_sqlcode NUMBER;
+        v_sqlerrm VARCHAR2(4000);
+    BEGIN
+        IF v_call_ids.COUNT = 0 THEN
+            RETURN;
+        END IF;
+
+        -- Bulk insert with per-row error capture
+        FORALL i IN 1..v_call_ids.COUNT SAVE EXCEPTIONS
+            INSERT INTO call_log (
+                ats_call_id,
+                call_start_date,
+                call_end_date,
+                outgoing_phone,
+                incoming_phone,
+                call_status,
+                is_redirected,
+                call_duration_sec,
+                outgoing_contragent_id,
+                incoming_contragent_id
+            ) VALUES (
+                v_call_ids(i),
+                v_start_dates(i),
+                v_end_dates(i),
+                v_outgoing_phones(i),
+                v_incoming_phones(i),
+                v_statuses(i),
+                v_is_redirected(i),
+                v_durations(i),
+                v_outgoing_contragents(i),
+                v_incoming_contragents(i)
+            );
+
+        v_processed_count := v_processed_count + v_call_ids.COUNT;
+
+        -- Clear collections for next batch
+        v_call_ids.DELETE;
+        v_start_dates.DELETE;
+        v_end_dates.DELETE;
+        v_outgoing_phones.DELETE;
+        v_incoming_phones.DELETE;
+        v_statuses.DELETE;
+        v_is_redirected.DELETE;
+        v_durations.DELETE;
+        v_outgoing_contragents.DELETE;
+        v_incoming_contragents.DELETE;
+
+        COMMIT;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            -- If we used SAVE EXCEPTIONS, Oracle provides SQL%BULK_EXCEPTIONS
+            IF SQL%BULK_EXCEPTIONS.COUNT > 0 THEN
+                FOR j IN 1..SQL%BULK_EXCEPTIONS.COUNT LOOP
+                    v_error_count := v_error_count + 1;
+                    v_sqlcode := SQL%BULK_EXCEPTIONS(j).ERROR_CODE;
+                    v_sqlerrm := SQLERRM(-v_sqlcode);
+
+                    DBMS_OUTPUT.PUT_LINE(
+                        'Row error for ATS call id ' ||
+                        v_call_ids(SQL%BULK_EXCEPTIONS(j).ERROR_INDEX) ||
+                        ': ' || v_sqlerrm
+                    );
+                END LOOP;
+            ELSE
+                v_error_count := v_error_count + v_call_ids.COUNT;
+                DBMS_OUTPUT.PUT_LINE('Batch error: ' || SQLERRM);
+            END IF;
+
+            -- Clear collections even if the batch failed
+            v_call_ids.DELETE;
+            v_start_dates.DELETE;
+            v_end_dates.DELETE;
+            v_outgoing_phones.DELETE;
+            v_incoming_phones.DELETE;
+            v_statuses.DELETE;
+            v_is_redirected.DELETE;
+            v_durations.DELETE;
+            v_outgoing_contragents.DELETE;
+            v_incoming_contragents.DELETE;
+
+            COMMIT;
+    END process_batch;
+
+BEGIN
+    /* Read from raw log table in a predictable order */
+    FOR rec IN (
+        SELECT
+            call_id,
+            start_date,
+            end_date,
+            outgoing_num,
+            incoming_num,
+            status,
+            is_redirect
+        FROM log_raw
+        ORDER BY call_id
+    )
+    LOOP
+        BEGIN
+            /* Optional duplicate check (unique index also protects ats_call_id)
+               Note: This check runs only when starting a new batch */
+            IF v_call_ids.COUNT = 0 THEN
+                DECLARE
+                    v_exists NUMBER;
+                BEGIN
+                    SELECT COUNT(*) INTO v_exists
+                    FROM call_log
+                    WHERE ats_call_id = rec.call_id;
+
+                    IF v_exists > 0 THEN
+                        CONTINUE; -- skip duplicates
+                    END IF;
+                END;
+            END IF;
+
+            -- Extend arrays
+            v_call_ids.EXTEND;
+            v_start_dates.EXTEND;
+            v_end_dates.EXTEND;
+            v_outgoing_phones.EXTEND;
+            v_incoming_phones.EXTEND;
+            v_statuses.EXTEND;
+            v_is_redirected.EXTEND;
+            v_durations.EXTEND;
+            v_outgoing_contragents.EXTEND;
+            v_incoming_contragents.EXTEND;
+
+            -- Assign values to arrays (convert strings to DATE)
+            v_call_ids(v_call_ids.COUNT) := rec.call_id;
+            v_start_dates(v_start_dates.COUNT) := TO_DATE(rec.start_date, 'DD.MM.YYYY HH24:MI:SS');
+            v_end_dates(v_end_dates.COUNT) := TO_DATE(rec.end_date, 'DD.MM.YYYY HH24:MI:SS');
+
+            v_outgoing_phones(v_outgoing_phones.COUNT) := rec.outgoing_num;
+            v_incoming_phones(v_incoming_phones.COUNT) := rec.incoming_num;
+
+            v_statuses(v_statuses.COUNT) := rec.status;
+
+            -- Normalize redirect flag to Y/N
+            v_is_redirected(v_is_redirected.COUNT) :=
+                CASE rec.is_redirect WHEN 'Yes' THEN 'Y' ELSE 'N' END;
+
+            -- Calculate duration in seconds
+            v_durations(v_durations.COUNT) := ROUND(
+                (TO_DATE(rec.end_date, 'DD.MM.YYYY HH24:MI:SS') -
+                 TO_DATE(rec.start_date, 'DD.MM.YYYY HH24:MI:SS')) * 86400
+            );
+
+            -- Lookup contragents by phone (cached)
+            v_outgoing_contragents(v_outgoing_contragents.COUNT) := find_contragent_id(rec.outgoing_num);
+            v_incoming_contragents(v_incoming_contragents.COUNT) := find_contragent_id(rec.incoming_num);
+
+            -- Process batch when the collection reaches the batch size
+            IF v_call_ids.COUNT >= c_batch_size THEN
+                process_batch;
+            END IF;
+
+        EXCEPTION
+            WHEN OTHERS THEN
+                v_error_count := v_error_count + 1;
+                DBMS_OUTPUT.PUT_LINE('Error preparing row ' || rec.call_id || ': ' || SQLERRM);
+        END;
+    END LOOP;
+
+    -- Process remaining rows
+    IF v_call_ids.COUNT > 0 THEN
+        process_batch;
+    END IF;
+
+    -- Print simple stats
+    DBMS_OUTPUT.PUT_LINE('========================================');
+    DBMS_OUTPUT.PUT_LINE('Load finished');
+    DBMS_OUTPUT.PUT_LINE('Rows processed: ' || v_processed_count);
+    DBMS_OUTPUT.PUT_LINE('Errors: ' || v_error_count);
+    DBMS_OUTPUT.PUT_LINE('Runtime: ' ||
+        TO_CHAR(SYSTIMESTAMP - v_start_time, 'HH24:MI:SS.FF3'));
+    DBMS_OUTPUT.PUT_LINE('========================================');
+
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        DBMS_OUTPUT.PUT_LINE('Critical error: ' || SQLERRM);
+        DBMS_OUTPUT.PUT_LINE('Rows processed before error: ' || v_processed_count);
+        RAISE;
+END load_call_log_from_raw;
+/
